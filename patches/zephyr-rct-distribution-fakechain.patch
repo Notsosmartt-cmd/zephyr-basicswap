@@ -1,0 +1,45 @@
+From 270c35acb9199c9bf930246d373e4888189fa1b9 Mon Sep 17 00:00:00 2001
+From: Dominick Rodriguez <DominickRodriguez63@gmail.com>
+Date: Mon, 29 Jun 2026 18:31:12 -0400
+Subject: [PATCH] wallet: build RingCT output distribution on short chains
+ (fakechain/regtest)
+
+get_rct_distribution floors the per-asset output-distribution query's from_height
+at the mainnet fork heights (AUDIT_FORK_HEIGHT for ZPH/ZSD/ZRS/ZYS,
+YIELD_FORK_HEIGHT for ZYIELD). On a chain shorter than that floor - a fakechain or
+regtest network - from_height exceeds the chain tip, the daemon's
+get_output_distribution returns false ("failed to get output distribution"), and no
+RingCT transaction can be built (an isolated self-transfer, or any spend, fails).
+
+Clamp from_height to genesis when it is at or past the current blockchain height.
+This is a strict no-op on mainnet (height is far past the fork floors); on a short
+chain it counts the distribution from genesis, which already contains enough
+coinbase-derived amount=0 RingCT outputs to satisfy the ring size.
+
+This unblocks RingCT on private chains, which downstream regtest/CI tooling (e.g.
+atomic-swap test harnesses) needs, without affecting mainnet behaviour.
+---
+ src/wallet/wallet2.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/wallet/wallet2.cpp b/src/wallet/wallet2.cpp
+index 87bdfcb..646622e 100644
+--- a/src/wallet/wallet2.cpp
++++ b/src/wallet/wallet2.cpp
+@@ -4312,6 +4312,13 @@ bool wallet2::get_rct_distribution(const std::string rct_asset_type, uint64_t &s
+   else
+     req.from_height = 0;
+ 
++  // On a chain shorter than the per-asset fork floor (fakechain/regtest), the floor set
++  // above can exceed the chain tip, so the daemon's get_output_distribution returns false
++  // ("failed to get output distribution") and no RingCT tx can be built. Clamp to genesis
++  // when the floor is at or past the current tip. No-op on mainnet (height >> the floor).
++  if (req.from_height >= get_blockchain_current_height())
++    req.from_height = 0;
++
+   req.rct_asset_type = rct_asset_type;
+   req.cumulative = false;
+   req.binary = true;
+-- 
+2.54.0
+
