@@ -1,0 +1,89 @@
+# GitHub Actions watcher for the ZEPH hosting repo (Notsosmartt-cmd/zephyr-basicswap), the repo whose
+# SHA256SUMS basicswap-prepare verifies the official Zephyr CLI against (prepare.py assert_url).
+#
+# On a schedule it checks ZephyrProtocol/zephyr for the latest release; if that version is not yet
+# pinned it downloads the official linux CLI zip, sanity-checks it, computes the SHA256SUMS, and commits
+# it INTO THE VERSIONED SUBDIR that prepare.py reads. BasicSwap then auto-sees the new hash via
+# assert_url - no BasicSwap PR for the hash (only the ZEPHYR_VERSION bump needs one, as for every coin).
+#
+# PATH CONTRACT (the fix, 2026-07-01): prepare.py reads
+#   raw.githubusercontent.com/Notsosmartt-cmd/zephyr-basicswap/main/<version>/SHA256SUMS
+# where <version> is ZEPHYR_VERSION (the tag with the leading v stripped, e.g. v2.3.0 -> 2.3.0). So this
+# workflow writes "<ver>/SHA256SUMS", NOT a root-level SHA256SUMS. It only CREATES a new version dir and
+# never rewrites an existing one, so a hand-added fallback line (e.g. the reu26 patched zip on 2.3.0) is
+# never clobbered.
+#
+# ROUTE 2 (this file): hash Zephyr's OFFICIAL linux zip. The PR uses the official binary + the test-side
+# rct_distribution_proxy, so the official release needs NO patch - the old clamp-presence gate is
+# therefore dropped; a lightweight "zip contains the two binaries" check replaces it. The Path B variant
+# (build the patched CLI, then hash your own build) lives in build-and-hash-zeph-cli.sh, not here.
+
+name: zeph-hash-watcher
+on:
+  schedule:
+    - cron: '0 6 * * *'      # daily (Zephyr releases are infrequent; daily is ample)
+  workflow_dispatch: {}       # allow manual runs / testing
+
+permissions:
+  contents: write
+
+jobs:
+  update-hash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Look up Zephyr's latest release
+        id: zeph
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo ZephyrProtocol/zephyr --json tagName -q .tagName)
+          ver="${tag#v}"                       # v2.3.0 -> 2.3.0 (matches ZEPHYR_VERSION in prepare.py)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "Latest Zephyr release: $tag (version $ver)"
+
+      - name: Skip if this version is already pinned
+        id: check
+        run: |
+          if [ -f "${{ steps.zeph.outputs.ver }}/SHA256SUMS" ]; then
+            echo "stale=no" >> "$GITHUB_OUTPUT"
+            echo "Already pinned ${{ steps.zeph.outputs.ver }}; nothing to do."
+          else
+            echo "stale=yes" >> "$GITHUB_OUTPUT"
+            echo "New version ${{ steps.zeph.outputs.ver }}; will pin."
+          fi
+
+      - name: Download the official CLI, sanity-check, and hash into the versioned dir
+        if: steps.check.outputs.stale == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.zeph.outputs.tag }}
+          VER: ${{ steps.zeph.outputs.ver }}
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir dist
+          gh release download "$TAG" --repo ZephyrProtocol/zephyr \
+            --pattern 'zephyr-cli-linux-*.zip' --dir dist
+          zip=$(ls dist/zephyr-cli-linux-*.zip 2>/dev/null | head -1)
+          if [ -z "$zip" ]; then
+            echo "::error::no zephyr-cli-linux-*.zip asset on $TAG (asset naming may have changed) - not pinning"
+            exit 1
+          fi
+          # Sanity gate: the release must actually carry the two binaries we ship (catches gross breakage;
+          # it is NOT a supply-chain guarantee - that is what the signing Action / issue #68 is for).
+          unzip -l "$zip" | grep -q 'zephyrd'            || { echo "::error::zephyrd missing in $zip"; exit 1; }
+          unzip -l "$zip" | grep -q 'zephyr-wallet-rpc'  || { echo "::error::zephyr-wallet-rpc missing in $zip"; exit 1; }
+          mkdir -p "$VER"
+          ( cd dist && sha256sum zephyr-cli-linux-*.zip ) > "$VER/SHA256SUMS"
+          echo "----- new $VER/SHA256SUMS -----"; cat "$VER/SHA256SUMS"
+
+      - name: Commit the pinned hash
+        if: steps.check.outputs.stale == 'yes'
+        run: |
+          git config user.name  "zeph-hash-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add "${{ steps.zeph.outputs.ver }}/SHA256SUMS"
+          git commit -m "zeph: pin SHA256SUMS for ${{ steps.zeph.outputs.tag }}" && git push \
+            || echo "nothing to commit"
